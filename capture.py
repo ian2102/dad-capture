@@ -9,23 +9,35 @@ from typing import Tuple, Optional
 import threading
 import asyncio
 import importlib
+from urllib.request import urlopen
 
-from protos import _PacketCommand_pb2
+build_version_url = "http://cdn.darkanddarker.com/Dark%20and%20Darker/Build/BuildVersion.txt"
+
+with urlopen(build_version_url, timeout=5) as f:
+    build_version = f.read().decode("utf-8").strip()
 
 # Determine paths
 current_dir = os.path.dirname(os.path.abspath(__file__))
-protos_path = os.path.join(current_dir, "protos")
+protos_path = os.path.join(current_dir, "protos", build_version)
+
+if build_version:
+    if not os.path.exists(protos_path):
+        sys.exit("Please update protos using extract.bat.")
+else:
+    sys.exit("Failed to get build version.")
 
 # Ensure the protos path is on sys.path
 if protos_path not in sys.path:
     sys.path.insert(0, protos_path)
+
+import _PacketCommand_pb2
 
 # Dynamically load each _pb2 module under the package name protos.xxx_pb2
 for filename in os.listdir(protos_path):
     if not filename.endswith("_pb2.py"):
         continue
 
-    module_name = filename[:-3]  # "Account_pb2"
+    module_name = filename[:-3]
     full_name   = f"protos.{module_name}"
     file_path   = os.path.join(protos_path, filename)
 
@@ -39,7 +51,9 @@ for filename in os.listdir(protos_path):
     # Execute the module
     spec.loader.exec_module(module)
 
-    # Bring its public names into globals()
+    # Bring its public names into globals() TODO
+    # self.proto_classes = {}
+    # message_class = self.proto_classes.get("S" + command_name)
     for attr in dir(module):
         if not attr.startswith("_"):
             globals()[attr] = getattr(module, attr)
@@ -87,14 +101,17 @@ class PacketCapture:
     def validate_packet_header(self, length: int, proto_type: int, padding: int) -> bool:
         """Validate packet header values"""
         valid_packet_range = (8, 2 * 1024 * 1024)  # Between 100 bytes and 2MB
-        valid_packet_range = (8, 189999)
-        return (
-            valid_packet_range[0] <= length <= valid_packet_range[1] and
-            proto_type in _PacketCommand_pb2.PacketCommand.values() and 
-            (_PacketCommand_pb2.PacketCommand.Name(proto_type).startswith("S") or 
-             _PacketCommand_pb2.PacketCommand.Name(proto_type).startswith("C"))
-            #padding in range(0, 256)  # Common padding values
-        )
+        # valid_packet_range = (8, 189999)
+        try:
+            return (
+                valid_packet_range[0] <= length <= valid_packet_range[1] and
+                _PacketCommand_pb2.PacketCommand.Name(proto_type) and 
+                (_PacketCommand_pb2.PacketCommand.Name(proto_type).startswith("S") or 
+                _PacketCommand_pb2.PacketCommand.Name(proto_type).startswith("C"))
+                #padding in range(0, 256)  # Common padding values
+            )
+        except ValueError:
+            return False
 
     def process_packet(self, data: bytes) -> Optional[bool]:
         if len(data) > 0:
@@ -114,8 +131,11 @@ class PacketCapture:
                     packet_length, proto_type, random_padding = struct.unpack('<IHH', self.packet_data[:8])
                     
                     # Get packet type name from _PacketCommand_pb2 before validation
-                    packet_type_name = _PacketCommand_pb2._PACKETCOMMAND.values_by_number[proto_type].name if proto_type in _PacketCommand_pb2._PACKETCOMMAND.values_by_number else "Unknown"
-                    
+                    try:
+                        packet_type_name = _PacketCommand_pb2.PacketCommand.Name(proto_type)
+                    except ValueError:
+                        packet_type_name = "Unknown"
+
                     if not self.validate_packet_header(packet_length, proto_type, random_padding):
                         #self.logger.warning(f"Invalid packet: {packet_type_name} (Type={proto_type}, Length={packet_length}, Padding={random_padding})")
                         self.reset_state()
@@ -131,12 +151,23 @@ class PacketCapture:
                     return False
 
             # Process packet data
-            if self.expected_packet_length and self.expected_proto_type:
-                # Handle overflow by trimming
+            if self.expected_packet_length is not None and self.expected_proto_type is not None:
+                # Handle overflow by trimming TODO
                 if current_size > self.expected_packet_length:
                     self.logger.info(f"Trimming overflow {current_size} -> {self.expected_packet_length}")
                     self.packet_data = self.packet_data[:self.expected_packet_length]
                     current_size = self.expected_packet_length
+                
+                # maybe safer?
+                # while len(self.packet_data) >= self.expected_packet_length:
+                #     packet = self.packet_data[:self.expected_packet_length]
+                #     remainder = self.packet_data[self.expected_packet_length:]
+
+                #     self.handle_packet(packet, self.expected_proto_type)
+                #     self.packet_data = remainder
+                #     self.expected_packet_length = None
+                #     self.expected_proto_type = None
+
 
                 # Complete packet
                 if current_size == self.expected_packet_length:
