@@ -6,7 +6,10 @@ import os
 def save(capture, message, name):
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
 
-    dir_path = f"data/{name}"
+    base_dir = "data"
+    dir_path = os.path.join(base_dir, name)
+
+    # ensure base + target directories exist
     os.makedirs(dir_path, exist_ok=True)
 
     file_path = os.path.join(dir_path, f"{timestamp}.txt")
