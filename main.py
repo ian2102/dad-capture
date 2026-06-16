@@ -1,37 +1,36 @@
-from capture import PacketCapture
-import time
+from capture import DarkandDarkerCapture
+from google.protobuf.json_format import MessageToJson
+from datetime import datetime
+import os
 
-from protos import _PacketCommand_pb2
-from protos import _Defins_pb2
+def save(capture, message, name):
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
 
-pc = _PacketCommand_pb2.PacketCommand
+    dir_path = f"data/{name}"
+    os.makedirs(dir_path, exist_ok=True)
 
+    file_path = os.path.join(dir_path, f"{timestamp}.txt")
 
-def save(message):
-    with open("output.txt", "a") as file:
-        file.write(str(message) + "\n")
+    with open(file_path, "w") as file:
+        json_str = MessageToJson(message, always_print_fields_with_no_presence=True)
+        file.write(json_str)
 
-def show(message):
-    from google.protobuf.json_format import MessageToJson
+def show(capture, message, name):
     json_str = MessageToJson(message, always_print_fields_with_no_presence=True)
     print(json_str)
 
 def main():
-    capture_info = {
-    }
+    # Network interface used for packet capture (change as needed)
+    INTERFACE = "Ethernet"
+    dc = DarkandDarkerCapture(INTERFACE)
 
-    # save all packets to output.txt
-    for value in pc.values():
-        capture_info[value] = save
+    # Setup capture to save all packets
+    for command_name in dc.pc.keys():
+        dc.capture_info[command_name] = save
 
-    capture = PacketCapture(capture_info)
+    # Run continuous capture
+    dc.capture()
 
-    capture.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        capture.stop()
 
 if __name__ == "__main__":
     main()

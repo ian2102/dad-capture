@@ -1,292 +1,149 @@
-import pyshark
-import socket
-import psutil
-import struct
-import logging
 import os
 import sys
-from typing import Tuple, Optional
-import threading
-import asyncio
-import importlib
-from urllib.request import urlopen
+import pyshark
+import struct
+import importlib.util
 
-build_version_url = "http://cdn.darkanddarker.com/Dark%20and%20Darker/Build/BuildVersion.txt"
-
-with urlopen(build_version_url, timeout=5) as f:
-    build_version = f.read().decode("utf-8").strip()
-
-# Determine paths
-current_dir = os.path.dirname(os.path.abspath(__file__))
-protos_path = os.path.join(current_dir, "protos", build_version)
-
-if build_version:
-    if not os.path.exists(protos_path):
-        sys.exit("Please update protos using extract.bat.")
-else:
-    sys.exit("Failed to get build version.")
-
-# Ensure the protos path is on sys.path
-if protos_path not in sys.path:
-    sys.path.insert(0, protos_path)
-
-import _PacketCommand_pb2
-
-# Dynamically load each _pb2 module under the package name protos.xxx_pb2
-for filename in os.listdir(protos_path):
-    if not filename.endswith("_pb2.py"):
-        continue
-
-    module_name = filename[:-3]
-    full_name   = f"protos.{module_name}"
-    file_path   = os.path.join(protos_path, filename)
-
-    # Create a module spec
-    spec = importlib.util.spec_from_file_location(full_name, file_path)
-    module = importlib.util.module_from_spec(spec)
-
-    # Insert into sys.modules so relative imports inside will resolve
-    sys.modules[full_name] = module
-
-    # Execute the module
-    spec.loader.exec_module(module)
-
-    # Bring its public names into globals() TODO
-    # self.proto_classes = {}
-    # message_class = self.proto_classes.get("S" + command_name)
-    for attr in dir(module):
-        if not attr.startswith("_"):
-            globals()[attr] = getattr(module, attr)
-
-class PacketCapture:
-    def __init__(self, capture_info, interface: str = 'Ethernet', port_range: Tuple[int, int] = (20200, 20300)):
+class DarkandDarkerCapture:
+    def __init__(self, interface):
         self.interface = interface
-        self.port_range = port_range
-        self.packet_data = b""
-        logging.basicConfig(level=logging.INFO)
-        self.logger = logging.getLogger(__name__)
-        self.MAX_BUFFER_SIZE = 1024 * 1024  # 1MB
-        self.expected_packet_length = None
-        self.expected_proto_type = None
-        self.running = False
-        self.capture_thread = None
-        self.capture_info = capture_info
 
-    def parse_proto(self, packet_data, proto_type):
-        data = packet_data[8:]
+        # Determine paths
+        self.current_dir = os.path.dirname(os.path.abspath(__file__))
+        self.build_version = self.get_build_version()
 
-        command_name = _PacketCommand_pb2.PacketCommand.Name(proto_type)
+        if not self.build_version:
+            sys.exit("Failed to get build version.")
 
-        try:
-            # For server packets
-            message_class = globals().get("S" + command_name)
-            if message_class:
-                message = message_class()
-                message.ParseFromString(data)
-                if message:
-                    return message
-        except Exception as e:
-            self.logger.warning(f"Error parsing proto: {e}")
+        self.protos_path = os.path.join(self.current_dir, "states", self.build_version, "protos")
 
-        return None
-
-    def get_local_ip(self) -> Optional[str]:
-        for interface, addrs in psutil.net_if_addrs().items():
-            if interface == self.interface:
-                for addr in addrs:
-                    if addr.family == socket.AF_INET:
-                        return addr.address
-        return None
-
-    def validate_packet_header(self, length: int, proto_type: int, padding: int) -> bool:
-        """Validate packet header values"""
-        valid_packet_range = (8, 2 * 1024 * 1024)  # Between 100 bytes and 2MB
-        # valid_packet_range = (8, 189999)
-        try:
-            return (
-                valid_packet_range[0] <= length <= valid_packet_range[1] and
-                _PacketCommand_pb2.PacketCommand.Name(proto_type) and 
-                (_PacketCommand_pb2.PacketCommand.Name(proto_type).startswith("S") or 
-                _PacketCommand_pb2.PacketCommand.Name(proto_type).startswith("C"))
-                #padding in range(0, 256)  # Common padding values
-            )
-        except ValueError:
-            return False
-
-    def process_packet(self, data: bytes) -> Optional[bool]:
-        if len(data) > 0:
-            # Add incoming data to buffer
-            self.packet_data += data
-            current_size = len(self.packet_data)
-            
-            # Reset if buffer gets too large
-            if current_size > self.MAX_BUFFER_SIZE:
-                self.logger.warning(f"Buffer exceeded max size ({self.MAX_BUFFER_SIZE} bytes)")
-                self.reset_state()
-                return False
-
-            # Try to parse/validate header
-            if self.expected_packet_length is None and current_size >= 8:
-                try:
-                    packet_length, proto_type, random_padding = struct.unpack('<IHH', self.packet_data[:8])
-                    
-                    # Get packet type name from _PacketCommand_pb2 before validation
-                    try:
-                        packet_type_name = _PacketCommand_pb2.PacketCommand.Name(proto_type)
-                    except ValueError:
-                        packet_type_name = "Unknown"
-
-                    if not self.validate_packet_header(packet_length, proto_type, random_padding):
-                        #self.logger.warning(f"Invalid packet: {packet_type_name} (Type={proto_type}, Length={packet_length}, Padding={random_padding})")
-                        self.reset_state()
-                        return False
-                    
-
-                    #self.logger.info(f"New packet: {packet_type_name} (Type={proto_type}, Length={packet_length}, Padding={random_padding})")
-                    
-                    self.expected_packet_length = packet_length
-                    self.expected_proto_type = proto_type
-                except struct.error:
-                    self.reset_state()
-                    return False
-
-            # Process packet data
-            if self.expected_packet_length is not None and self.expected_proto_type is not None:
-                # Handle overflow by trimming TODO
-                if current_size > self.expected_packet_length:
-                    self.logger.info(f"Trimming overflow {current_size} -> {self.expected_packet_length}")
-                    self.packet_data = self.packet_data[:self.expected_packet_length]
-                    current_size = self.expected_packet_length
-                
-                # maybe safer?
-                # while len(self.packet_data) >= self.expected_packet_length:
-                #     packet = self.packet_data[:self.expected_packet_length]
-                #     remainder = self.packet_data[self.expected_packet_length:]
-
-                #     self.handle_packet(packet, self.expected_proto_type)
-                #     self.packet_data = remainder
-                #     self.expected_packet_length = None
-                #     self.expected_proto_type = None
-
-
-                # Complete packet
-                if current_size == self.expected_packet_length:
-                    self.handle_packet(self.packet_data, self.expected_proto_type)
-                    self.reset_state()
-                # Progress update
-                elif current_size % 8192 == 0:
-                    self.logger.info(f"Accumulating: {current_size}/{self.expected_packet_length}")
-        return False
-
-    def reset_state(self) -> None:
-        """Reset all packet processing state"""
-        self.packet_data = b""
-        self.expected_packet_length = None
-        self.expected_proto_type = None
-
-    def capture_loop(self) -> None:
-        # Set up event loop for this thread
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        if not os.path.isdir(self.protos_path):
+            sys.exit("Please update protos using extract script.")
         
-        local_ip = self.get_local_ip()
-        if not local_ip:
-            self.logger.error(f"Could not find IP address for interface {self.interface}")
-            return
-            
-        display_filter = (
-            # f'((ip.src == {local_ip} and tcp.srcport >= {self.port_range[0]} and tcp.srcport <= {self.port_range[1]}) or '
-            # f'(ip.dst == {local_ip} and tcp.dstport >= {self.port_range[0]} and tcp.dstport <= {self.port_range[1]}))'
+        self.proto_modules = {}
+        self.import_protos()
+        self.pc = self.proto_modules["_PacketCommand_pb2"].PacketCommand
+
+        self.packet_buffer = b''
+        self.capture_info = {}
+
+    def get_build_version(self):
+        build_version_file = os.path.join(self.current_dir, "BuildVersion.txt")
+
+        with open(build_version_file, "r", encoding="utf-8") as f:
+            return f.read().strip()
+
+    def import_protos(self):
+        # Add folder to sys.path so submodules can import correctly
+        sys.path.insert(0, self.protos_path)
+
+        for root, dirs, files in os.walk(self.protos_path):
+            for file in files:
+                if file.endswith("_pb2.py"):
+                    full_path = os.path.join(root, file)
+                    
+                    rel_path = os.path.relpath(full_path, self.protos_path)
+                    module_name = rel_path.replace(os.sep, ".").replace(".py", "")
+                    
+                    # Import dynamically
+                    spec = importlib.util.spec_from_file_location(module_name, full_path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                    
+                    self.proto_modules[module_name] = module
+        
+                    # Bring its public names into globals()
+                    for attr in dir(module):
+                        if not attr.startswith("_"):
+                            globals()[attr] = getattr(module, attr)
+                            
+    def capture(self):
+        capture = pyshark.LiveCapture(
+            interface=self.interface,
+            bpf_filter='tcp portrange 20200-20300'
         )
-        
-        # Store capture object as instance variable for cleanup
-        self._current_capture = pyshark.LiveCapture(interface=self.interface, display_filter=display_filter)
-        self._current_loop = loop
-        
+
+        print("Starting continuous capture... Press Ctrl+C to stop.")
+
         try:
-            for packet in self._current_capture.sniff_continuously():
-                if not self.running:
-                    break
-                if 'TCP' in packet and hasattr(packet.tcp, 'payload'):
-                    self.process_packet(packet.tcp.payload.binary_value)
-        except Exception as e:
-            self.logger.error(f"Capture loop error: {e}")
-        finally:
-            self._cleanup_capture()
+            for packet in capture.sniff_continuously():
+                try:
+                    if hasattr(packet, 'tcp') and hasattr(packet.tcp, 'payload'):
 
-    def _cleanup_capture(self):
-        """Clean up capture resources properly"""
+                        # Append new TCP payload
+                        self.packet_buffer += packet.tcp.payload.binary_value
+
+                        # Process as many packets as possible
+                        while True:
+
+                            # Need at least header
+                            if len(self.packet_buffer) < 8:
+                                break
+
+                            packet_length, proto_type, random_padding = struct.unpack(
+                                "<IHH", self.packet_buffer[:8]
+                            )
+
+                            # Sanity checks
+                            if proto_type not in self.pc.values():
+                                print("Invalid proto type, clearing buffer")
+                                self.packet_buffer = b''
+                                break
+
+                            if packet_length > 9154122 or packet_length < 8:
+                                print("Invalid packet length, clearing buffer")
+                                self.packet_buffer = b''
+                                break
+
+                            # Wait for full packet
+                            if len(self.packet_buffer) < packet_length:
+                                #print(f"{len(self.packet_buffer)} < {packet_length}")
+                                break
+
+                            name = self.pc.Name(proto_type)
+                            
+                            # Debug statments
+                            #print(name, packet_length, proto_type, random_padding)
+                            #print(f"{len(self.packet_buffer)} >= {packet_length}")
+
+                            # Extract full packet
+                            packet = self.packet_buffer[:packet_length]
+
+                            # Remove packet from buffer
+                            self.packet_buffer = self.packet_buffer[packet_length:]
+
+                            # Extract protobuf payload
+                            packet_data = packet[8:]
+
+                            # Parse
+                            self.parse_proto(packet_data, name)
+
+                except AttributeError:
+                    continue
+
+        except KeyboardInterrupt:
+            print("\nStopping capture...")
+        finally:
+            capture.close()
+
+    def parse_proto(self, packet_data, name):
+        message_class = globals().get("S" + name)
+        if not message_class:
+            print(f"No proto class named {name}")
+
         try:
-            if hasattr(self, '_current_capture'):
-                # Create a new event loop for cleanup if needed
-                if not hasattr(self, '_current_loop') or self._current_loop.is_closed():
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                else:
-                    loop = self._current_loop
-
-                # Run close_async in the event loop
-                if hasattr(self._current_capture, 'close_async'):
-                    loop.run_until_complete(self._current_capture.close_async())
-                else:
-                    self._current_capture.close()
-                
-                del self._current_capture
-                
-                # Clean up the event loop
-                if hasattr(self, '_current_loop'):
-                    if not self._current_loop.is_closed():
-                        self._current_loop.close()
-                    del self._current_loop
+            message = message_class()
+            message.ParseFromString(packet_data)
+            handler = self.capture_info.get(name)
+            if handler:
+                print(f"{name} -> {handler.__name__}")
+                handler(self, message, name)
         except Exception as e:
-            self.logger.error(f"Error during capture cleanup: {e}")
-        finally:
-            self.reset_state()
+            print(f"Error parsing proto {name}: {e}")
+            with open("dump.bin", "wb") as f:
+                f.write(packet_data)
+            exit()
 
-    def start(self) -> None:
-        """Start packet capture in background thread if not already running."""
-        if self.capture_thread is not None and self.capture_thread.is_alive():
-            self.logger.info("Capture already running, ignoring start request")
-            return
-        self.running = True
-        self.capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
-        self.capture_thread.start()
-        self.logger.info("Capture thread started")
-
-    def stop(self) -> None:
-        """Stop packet capture gracefully."""
-        if not self.running:
-            self.logger.info("Capture already stopped, ignoring stop request")
-            return
-        self.running = False
-        if self.capture_thread is not None:
-            self.capture_thread.join(timeout=10.0)
-            if self.capture_thread.is_alive():
-                self.logger.warning("Capture thread still running after timeout, forcing cleanup")
-                self._cleanup_capture()
-        self.capture_thread = None
-        self.logger.info("Capture switch turned OFF")
-
-    def _process_packet_wrapper(self, packet):
-        if 'TCP' in packet and hasattr(packet.tcp, 'payload'):
-            self.process_packet(packet.tcp.payload.binary_value)
-    
-    def handle_packet(self, packet_data, proto_type):
-        """Decide what to do with each packet."""
-        name = _PacketCommand_pb2.PacketCommand.Name(proto_type)
-        if self.capture_info:
-            message = self.parse_proto(packet_data, proto_type)
-            if proto_type in self.capture_info:
-                self.logger.info(f"Parsing: {name} {proto_type}")
-                if message:
-                    self.capture_info[proto_type](message)
-                else:
-                    self.logger.warning("Invalid Packet")
-            else:
-                pass
-                # self.logger.info(f"No handle for: {name} {proto_type}")
-                # if message:
-                #     self.logger.info("Valid Packet")
-                # else:
-                #     self.logger.warning("Invalid Packet")
+if __name__ == "__main__":
+    dc = DarkandDarkerCapture("Ethernet")
+    dc.capture()
