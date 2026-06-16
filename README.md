@@ -1,7 +1,7 @@
 # Dark and Darker Network Capture
 
-A tool to capture dark and darker network trafic.
-
+Dark and Darker network capture tool. 
+ 
 ## Prerequisites
 
 1. **Python**: Download from: [Python's official website](https://www.python.org/downloads/).
