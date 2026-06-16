@@ -24,31 +24,39 @@ A tool to capture dark and darker network trafic.
 
 1. **Extract and Compile Proto Files (required after every game update)**
 
+   You must configure the path to the game executable inside extract.ps1:
+   
+   ```powershell
+   $DungeonCrawlerExe = "C:\Program Files\IRONMACE\Dark and Darker\DungeonCrawler\Binaries\Win64\DungeonCrawler.exe"
+   ```
+
+   Then run:
+   
    ```cmd
    extract.ps1
    ```
 
-2. **Configure the network interface**
+1. **Configure the network interface**
 
    Open `main.py` and set your network adapter:
    ```python
    INTERFACE = "Ethernet"
    ```
 
-3. **Run the capture script**
+2. **Run the capture script**
 
    ```cmd
    python main.py
    ```
 
-4. **Output location**
+3. **Output location**
 
    Captured data is saved automatically to:
    ```
    data/<command_name>/<timestamp>.txt
    ```
 
-5. **Stop the program**
+4. **Stop the program**
 
    Press `CTRL + C` in the terminal to stop packet capture.
 
